@@ -16,6 +16,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -173,44 +175,98 @@ def plot_default_rate_by_category(df: pd.DataFrame, target: str, category: str):
     plt.show()
 
 
-def build_preprocessor(numeric_features, categorical_features):
+def build_preprocessor(numeric_features, categorical_features, use_ordinal_for_high_cardinality=True, high_card_threshold=30):
+    """
+    Build a ColumnTransformer preprocessor.
+
+    - numeric_features: list of numeric column names
+    - categorical_features: list of categorical column names
+    - use_ordinal_for_high_cardinality: if True, high-cardinality cats use OrdinalEncoder to save memory
+    - high_card_threshold: cardinality threshold above which a categorical feature is treated as high-cardinality
+    """
+    # Numeric pipeline
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler())
     ])
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent"))
+
+    # For categorical: we'll provide two encoders depending on cardinality.
+    # OneHot for low-cardinality (safe for interpretability), Ordinal for high-cardinality (memory friendly).
+    low_card_cats = list(categorical_features)  # by default assume all low; user can tweak
+    high_card_cats = []
+
+    # NOTE: We cannot compute cardinality here without data. If you want automatic split,
+    # call this function with lists already separated based on data cardinality.
+    # The simplest default: treat everything as low-cardinality and one-hot encode.
+    # If you have very large dataset and many categories, set use_ordinal_for_high_cardinality=True
+    # and manually separate lists before calling this function.
+
+    # OneHot pipeline (safe for small cardinality)
+    onehot_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False))
     ])
+
+    # Ordinal pipeline (memory friendly for high-cardinality)
+    ordinal_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ord", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+    ])
+
+    transformers = []
+    if low_card_cats:
+        transformers.append(("cat_onehot", onehot_transformer, low_card_cats))
+    if high_card_cats:
+        transformers.append(("cat_ord", ordinal_transformer, high_card_cats))
+
+    # If no categorical features, ColumnTransformer still needs numeric
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", numeric_transformer, numeric_features),
-            ("cat", categorical_transformer, categorical_features)
+            # add categorical transformers (if any)
+            *transformers
         ],
         remainder="drop"
     )
     return preprocessor
 
 
-def train_pd_model(X_train, y_train, preprocessor, model_type="log_reg"):
+
+
+def train_pd_model(X_train, y_train, preprocessor, model_type="log_reg", use_smote=False):
+    """
+    Train PD model. For large datasets set use_smote=False and rely on class_weight.
+    """
     if model_type == "log_reg":
-        model = LogisticRegression(max_iter=500)
+        if use_smote:
+            model = LogisticRegression(max_iter=500)
+        else:
+            # Use class_weight to handle imbalance without resampling
+            model = LogisticRegression(max_iter=500, class_weight="balanced")
     elif model_type == "rf":
-        model = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=None,
-            random_state=42,
-            class_weight="balanced"
-        )
+        if use_smote:
+            model = RandomForestClassifier(n_estimators=300, max_depth=None, random_state=42, class_weight=None)
+        else:
+            model = RandomForestClassifier(n_estimators=300, max_depth=None, random_state=42, class_weight="balanced")
     else:
         raise ValueError("model_type must be 'log_reg' or 'rf'")
 
-    clf = ImbPipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("smote", SMOTE(random_state=42)),
-        ("model", model)
-    ])
+    if use_smote:
+        clf = ImbPipeline(steps=[
+            ("preprocessor", preprocessor),
+            ("smote", SMOTE(random_state=42)),
+            ("model", model)
+        ])
+    else:
+        # sklearn Pipeline (no resampling)
+        clf = Pipeline(steps=[
+            ("preprocessor", preprocessor),
+            ("model", model)
+        ])
+
     clf.fit(X_train, y_train)
     return clf
+
 
 
 def evaluate_pd_model(clf, X_test, y_test, threshold=0.5, name="Model"):
